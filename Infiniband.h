@@ -215,6 +215,7 @@ class Infiniband {
       char* buffer; // TODO: remove buffer/refactor TX
       char  data[0];
       bufferlist bl;
+      bool copy = false;
       bool last = false;
     };
 

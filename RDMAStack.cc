@@ -383,7 +383,7 @@ void RDMADispatcher::handle_tx_event(ibv_wc *cqe, int n)
   for (int i = 0; i < n; ++i) {
     ibv_wc* response = &cqe[i];
     Chunk* chunk = reinterpret_cast<Chunk *>(response->wr_id);
-    ldout(cct, 0) << __func__ << " QP: " << response->qp_num
+    ldout(cct, 10) << __func__ << " QP: " << response->qp_num
                    << " len: " << response->byte_len << " , addr:" << chunk
                    << " " << get_stack()->get_infiniband().wc_status_to_string(response->status) << dendl;
     
@@ -431,6 +431,10 @@ void RDMADispatcher::handle_tx_event(ibv_wc *cqe, int n)
       conn->waiting_clear_add(chunk->get_offset());
       conn->clear_waiting_bl();
     }*/
+    if(chunk->copy){
+      chunk->copy=false;
+      tx_chunks.push_back(chunk);
+    }
  }
     //TX completion may come either from regular send message or from 'fin' message.
     //In the case of 'fin' wr_id points to the QueuePair.
@@ -445,7 +449,7 @@ void RDMADispatcher::handle_tx_event(ibv_wc *cqe, int n)
  */ 
   
   perf_logger->inc(l_msgr_rdma_tx_total_wc, n);
-  //post_tx_buffer(tx_chunks);
+  post_tx_buffer(tx_chunks);
 }
 
 /**
@@ -465,7 +469,7 @@ void RDMADispatcher::post_tx_buffer(std::vector<Chunk*> &chunks)
   get_stack()->get_infiniband().get_memory_manager()->return_tx(chunks);
   ldout(cct, 30) << __func__ << " release " << chunks.size()
                  << " chunks, inflight " << inflight << dendl;
-  notify_pending_workers();
+  //notify_pending_workers();
 }
 
 

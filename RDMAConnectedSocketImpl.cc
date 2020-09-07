@@ -443,33 +443,77 @@ ssize_t RDMAConnectedSocketImpl::zero_copy_send(bufferlist &data_bl,bool more)
   if (!bytes)
     return 0;
 
+   auto fill_tx_via_copy = [this](std::vector<Chunk*> &tx_buffers, unsigned bytes,
+                                 std::list<bufferptr>::const_iterator &start,
+                                 std::list<bufferptr>::const_iterator &end) -> unsigned {
+    assert(start != end);
+    auto chunk_idx = tx_buffers.size();
+    int ret = worker->get_reged_mem(this, tx_buffers, bytes);
+    if (ret == 0) {
+      ldout(cct, 1) << __func__ << " no enough buffers in worker " << worker << dendl;
+      worker->perf_logger->inc(l_msgr_rdma_tx_no_mem);
+      return 0;
+    }
+
+    unsigned total_copied = 0;
+    Chunk *current_chunk = tx_buffers[chunk_idx];
+    while (start != end) {
+      const uintptr_t addr = reinterpret_cast<uintptr_t>(start->c_str());
+      unsigned copied = 0;
+      while (copied < start->length()) {
+        uint32_t r = current_chunk->write((char*)addr+copied, start->length() - copied);
+        copied += r;
+        total_copied += r;
+        bytes -= r;
+        if (current_chunk->full()){
+          if (++chunk_idx == tx_buffers.size())
+            return total_copied;
+          current_chunk = tx_buffers[chunk_idx];
+        }
+      }
+      ++start;
+    }
+    assert(bytes == 0);
+    return total_copied;
+  };
+
   std::vector<Chunk*> tx_buffers;
   std::list<bufferptr>::const_iterator it = data_bl.buffers().begin();
   unsigned total = 0;
   uint64_t beg, end;
   auto conf_size = cct->_conf->ms_async_rdma_buffer_size;
   while (it != data_bl.buffers().end()) {
-    ldout(cct, 0) << __func__ << " send " << it->length() << dendl;
+    ldout(cct, 10) << __func__ << " send " << it->length() << dendl;
     unsigned buffer_size = it->length();
     const uintptr_t buffer_addr = reinterpret_cast<uintptr_t>(it->c_str());
     total_size+=buffer_size;
+    if(buffer_size < conf_size){
+      std::vector<Chunk*> env_buf;
+      auto copy_beg = it;
+      it++;
+      fill_tx_via_copy(env_buf, buffer_size, copy_beg, it);
+      Chunk* c = env_buf.front();
+      c->copy = true;
+      tx_buffers.push_back(c);
+      continue;    
+    }
     /* step 0 check addr had been regisetered */
     std::unordered_map<char*, Chunk*>::const_iterator flag= pending_chunks.find((char*)buffer_addr);
 
     if(flag!=pending_chunks.end()){
       beg = Cycles::rdtsc();
-      ldout(cct, 0) << __func__ << " find reged addr : " << buffer_addr << dendl;
+      ldout(cct,10) << __func__ << " find reged addr : " << buffer_addr << dendl;
       ibv_mr* new_mr = flag->second->mr;
       auto old_mr_len = flag->second->mr->length;
       if(old_mr_len < buffer_size){
             ibv_dereg_mr(new_mr);
             new_mr = ibv_reg_mr(qp->get_pd(), (char *)buffer_addr, buffer_size, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
-            ldout(cct, 0) << __func__ << " mr old size : " << old_mr_len << " need size: " << buffer_size <<" dereg old mr then reg new"<< dendl;
+            ldout(cct, 10) << __func__ << " mr old size : " << old_mr_len << " need size: " << buffer_size <<" dereg old mr then reg new"<< dendl;
       }
       Chunk *need_dereg = nullptr;      
       for (unsigned offset = 0; offset < buffer_size; offset += conf_size){
         std::unordered_map<char*, Chunk*>::const_iterator it= pending_chunks.find((char*)buffer_addr+offset);
-        ldout(cct, 0) << __func__ << " reged addr offset : " << offset << dendl;
+        ldout(cct, 10) << __func__ << " reged addr offset : " << offset << dendl;
         if(it!=pending_chunks.end()){
           Chunk* reged_chunk = it->second;
           reged_chunk->mr = new_mr;
@@ -481,7 +525,7 @@ ssize_t RDMAConnectedSocketImpl::zero_copy_send(bufferlist &data_bl,bool more)
             reged_chunk->set_offset(conf_size);
             cache_hit += conf_size;
           }
-          ldout(cct, 0) << __func__ << " chunk offset : " << reged_chunk->offset << dendl;
+          ldout(cct, 10) << __func__ << " chunk offset : " << reged_chunk->offset << dendl;
           tx_buffers.push_back(reged_chunk);
           
         }else{
@@ -491,12 +535,12 @@ ssize_t RDMAConnectedSocketImpl::zero_copy_send(bufferlist &data_bl,bool more)
           if(buffer_size - offset < conf_size){
             new(new_chunk) Chunk(new_mr, buffer_size - offset,(char *) buffer_addr + offset);
             new_chunk->set_offset(buffer_size - offset);
-            ldout(cct, 0) << __func__ << " set offset: " << buffer_size - offset << dendl;
+            ldout(cct,10) << __func__ << " set offset: " << buffer_size - offset << dendl;
           }
           else{
             new(new_chunk) Chunk(new_mr, conf_size,(char *) buffer_addr + offset);
             new_chunk->set_offset(conf_size);
-            ldout(cct, 0) << __func__ << " set offset: "<<conf_size  << dendl;
+            ldout(cct, 10) << __func__ << " set offset: "<<conf_size  << dendl;
           }
           need_dereg = new_chunk;
           tx_buffers.push_back(new_chunk);
@@ -511,7 +555,7 @@ ssize_t RDMAConnectedSocketImpl::zero_copy_send(bufferlist &data_bl,bool more)
       if(buffer_size > conf_size){
        total_time += time;
        total_num ++; 
-       ldout(cct, 0) << __func__ << " hit mr use :" << time << " us"<<" avg time: "<<total_time/total_num <<dendl;
+       ldout(cct, 0) << __func__ << " need size :" << total_size << " bytes,"<<" hit size: "<< cache_hit<<"bytes" <<dendl;
       }      
       continue;  
     }
@@ -531,12 +575,12 @@ ssize_t RDMAConnectedSocketImpl::zero_copy_send(bufferlist &data_bl,bool more)
       if(buffer_size - offset < conf_size){
 	    new(new_chunk) Chunk(m, buffer_size - offset,(char *) buffer_addr + offset);
         new_chunk->set_offset(buffer_size - offset);;
-        ldout(cct, 0) << __func__ << " set offset: " << buffer_size - offset << dendl;
+        ldout(cct, 10) << __func__ << " set offset: " << buffer_size - offset << dendl;
       }
       else{
         new(new_chunk) Chunk(m, conf_size,(char *) buffer_addr + offset);
         new_chunk->set_offset(conf_size);
-        ldout(cct, 0) << __func__ << " set offset: "<<conf_size  << dendl;
+        ldout(cct, 10) << __func__ << " set offset: "<<conf_size  << dendl;
       }
       tx_buffers.push_back(new_chunk);
       pending_chunks.insert(std::make_pair((char*)buffer_addr+offset, new_chunk));
