@@ -658,7 +658,7 @@ void Infiniband::MemoryManager::MemPoolContext::set_stat_logger(PerfCounters *lo
 void Infiniband::MemoryManager::MemPoolContext::update_stats(int nbufs)
 {
   n_bufs_allocated += nbufs;
-
+  n_bufs_left += nbufs;
   if (!perf_logger)
     return;
 

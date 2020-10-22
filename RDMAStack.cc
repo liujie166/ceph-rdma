@@ -377,17 +377,14 @@ void RDMADispatcher::erase_qpn(uint32_t qpn)
 void RDMADispatcher::handle_tx_event(ibv_wc *cqe, int n)
 {
   std::vector<Chunk*> tx_chunks;
-  //unsigned chunk_total_size = 0;
-  //bufferlist clear_bl;
- 
+
   for (int i = 0; i < n; ++i) {
     ibv_wc* response = &cqe[i];
     Chunk* chunk = reinterpret_cast<Chunk *>(response->wr_id);
-    ldout(cct, 10) << __func__ << " QP: " << response->qp_num
+    ldout(cct, 25) << __func__ << " QP: " << response->qp_num
                    << " len: " << response->byte_len << " , addr:" << chunk
                    << " " << get_stack()->get_infiniband().wc_status_to_string(response->status) << dendl;
-    
- 
+
     QueuePair *qp = get_qp(response->qp_num);
     if (qp)
       qp->dec_tx_wr(1);
@@ -410,44 +407,27 @@ void RDMADispatcher::handle_tx_event(ibv_wc *cqe, int n)
 
       Mutex::Locker l(lock);//make sure connected socket alive when pass wc
       RDMAConnectedSocketImpl *conn = get_conn_lockless(response->qp_num);
-      
+
       if (conn && conn->is_connected()) {
-        ldout(cct, 0) << __func__ << " qp state is : " << conn->get_qp_state() << dendl;//wangzhi
+        ldout(cct, 25) << __func__ << " qp state is : " << conn->get_qp_state() << dendl;//wangzhi
         conn->fault();
       } else {
-        ldout(cct, 0) << __func__ << " missing qp_num=" << response->qp_num << " discard event" << dendl;
+        ldout(cct, 1) << __func__ << " missing qp_num=" << response->qp_num << " discard event" << dendl;
       }
     }
-    if(chunk->bl.length())
-      chunk->bl.clear();
-    /*Mutex::Locker l(lock);
-    RDMAConnectedSocketImpl *conn = get_conn_lockless(response->qp_num);
-    if(!conn){
-      ldout(cct, 0) << __func__ << " conn is disconnect... " << dendl;
-      return ;
-    }
-    if(conn->is_waiting_buffer(chunk->buffer)){
-    ldout(cct, 0) << __func__ << " is waiting buffer " << dendl;
-      conn->waiting_clear_add(chunk->get_offset());
-      conn->clear_waiting_bl();
-    }*/
-    if(chunk->copy){
-      chunk->copy=false;
-      tx_chunks.push_back(chunk);
-    }
- }
+
     //TX completion may come either from regular send message or from 'fin' message.
     //In the case of 'fin' wr_id points to the QueuePair.
-   /* if (get_stack()->get_infiniband().get_memory_manager()->is_tx_buffer(chunk->buffer)) {
+    if (get_stack()->get_infiniband().get_memory_manager()->is_tx_buffer(chunk->buffer)) {
       tx_chunks.push_back(chunk);
     } else if (reinterpret_cast<QueuePair*>(response->wr_id)->get_local_qp_number() == response->qp_num ) {
-      ldout(cct, 0) << __func__ << " sending of the disconnect msg completed" << dendl;
+      ldout(cct, 1) << __func__ << " sending of the disconnect msg completed" << dendl;
     } else {
-      ldout(cct, 0) << __func__ << " not tx buffer, chunk " << chunk << dendl;
-      //ceph_abort();
+      ldout(cct, 1) << __func__ << " not tx buffer, chunk " << chunk << dendl;
+      ceph_abort();
     }
- */ 
-  
+  }
+
   perf_logger->inc(l_msgr_rdma_tx_total_wc, n);
   post_tx_buffer(tx_chunks);
 }
@@ -464,12 +444,12 @@ void RDMADispatcher::post_tx_buffer(std::vector<Chunk*> &chunks)
 {
   if (chunks.empty())
     return ;
-  
+
   inflight -= chunks.size();
   get_stack()->get_infiniband().get_memory_manager()->return_tx(chunks);
   ldout(cct, 30) << __func__ << " release " << chunks.size()
                  << " chunks, inflight " << inflight << dendl;
-  //notify_pending_workers();
+  notify_pending_workers();
 }
 
 
@@ -571,8 +551,7 @@ void RDMAWorker::handle_pending_message()
   while (!pending_sent_conns.empty()) {
     RDMAConnectedSocketImpl *o = pending_sent_conns.front();
     pending_sent_conns.pop_front();
-    bufferlist empty;
-    ssize_t r = o->zero_copy_send(empty,false);
+    ssize_t r = o->submit(false);
     ldout(cct, 20) << __func__ << " sent pending bl socket=" << o << " r=" << r << dendl;
     if (r < 0) {
       if (r == -EAGAIN) {

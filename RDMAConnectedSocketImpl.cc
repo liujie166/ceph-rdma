@@ -15,7 +15,7 @@
  */
 
 #include "RDMAStack.h"
-#include "common/Cycles.h"
+
 #define dout_subsys ceph_subsys_ms
 #undef dout_prefix
 #define dout_prefix *_dout << " RDMAConnectedSocketImpl "
@@ -161,7 +161,7 @@ int RDMAConnectedSocketImpl::activate()
   if (!is_server) {
     connected = 1; //indicate successfully
     ldout(cct, 20) << __func__ << " handle fake send, wake it up. QP: " << my_msg.qpn << dendl;
-    //zero_copy_send( false);
+    submit(false);
   }
   active = true;
 
@@ -248,8 +248,7 @@ void RDMAConnectedSocketImpl::handle_connection() {
       connected = 1;
       ldout(cct, 10) << __func__ << " handshake of rdma is done. server connected: " << connected << dendl;
       //cleanup();
-      
-      //zero_copy_send(false);
+      submit(false);
       notify();
     }
   }
@@ -325,7 +324,7 @@ ssize_t RDMAConnectedSocketImpl::read(char* buf, size_t len)
     ldout(cct, 20) << __func__ << " we do not need last handshake, QP: " << my_msg.qpn << " peer QP: " << peer_msg.qpn << dendl;
     connected = 1; //if so, we don't need the last handshake
     cleanup();
-    //zero_copy_send(false);
+    submit(false);
   }
 
   if (!buffers.empty()) {
@@ -420,30 +419,32 @@ ssize_t RDMAConnectedSocketImpl::send(bufferlist &bl, bool more)
     return 0;
   {
     Mutex::Locker l(lock);
+    pending_bl.claim_append(bl);
     if (!connected) {
       ldout(cct, 20) << __func__ << " fake send to upper, QP: " << my_msg.qpn << dendl;
       return bytes;
     }
-       
   }
-  ssize_t r = zero_copy_send(bl, more);
+  ldout(cct, 20) << __func__ << " QP: " << my_msg.qpn << dendl;
+  ssize_t r = submit(more);
   if (r < 0 && r != -EAGAIN)
     return r;
   return bytes;
 }
 
-ssize_t RDMAConnectedSocketImpl::zero_copy_send(bufferlist &data_bl,bool more)
+
+ssize_t RDMAConnectedSocketImpl::submit(bool more)
 {
   if (error)
     return -error;
   Mutex::Locker l(lock);
-  size_t bytes = data_bl.length();
+  size_t bytes = pending_bl.length();
   ldout(cct, 20) << __func__ << " we need " << bytes << " bytes. iov size: "
-                 << data_bl.buffers().size() << dendl;
+                 << pending_bl.buffers().size() << dendl;
   if (!bytes)
     return 0;
 
-   auto fill_tx_via_copy = [this](std::vector<Chunk*> &tx_buffers, unsigned bytes,
+  auto fill_tx_via_copy = [this](std::vector<Chunk*> &tx_buffers, unsigned bytes,
                                  std::list<bufferptr>::const_iterator &start,
                                  std::list<bufferptr>::const_iterator &end) -> unsigned {
     assert(start != end);
@@ -478,129 +479,36 @@ ssize_t RDMAConnectedSocketImpl::zero_copy_send(bufferlist &data_bl,bool more)
   };
 
   std::vector<Chunk*> tx_buffers;
-  std::list<bufferptr>::const_iterator it = data_bl.buffers().begin();
+  std::list<bufferptr>::const_iterator it = pending_bl.buffers().begin();
+  std::list<bufferptr>::const_iterator copy_it = it;
   unsigned total = 0;
-  uint64_t beg, end;
-  auto conf_size = cct->_conf->ms_async_rdma_buffer_size;
-  while (it != data_bl.buffers().end()) {
-    ldout(cct, 10) << __func__ << " send " << it->length() << dendl;
-    unsigned buffer_size = it->length();
-    const uintptr_t buffer_addr = reinterpret_cast<uintptr_t>(it->c_str());
-    total_size+=buffer_size;
-    if(buffer_size < conf_size){
-      std::vector<Chunk*> env_buf;
-      auto copy_beg = it;
-      it++;
-      fill_tx_via_copy(env_buf, buffer_size, copy_beg, it);
-      Chunk* c = env_buf.front();
-      c->copy = true;
-      tx_buffers.push_back(c);
-      continue;    
+  unsigned need_reserve_bytes = 0;
+  while (it != pending_bl.buffers().end()) {
+    if (infiniband->is_tx_buffer(it->raw_c_str())) {
+      if (need_reserve_bytes) {
+        unsigned copied = fill_tx_via_copy(tx_buffers, need_reserve_bytes, copy_it, it);
+        total += copied;
+        if (copied < need_reserve_bytes)
+          goto sending;
+        need_reserve_bytes = 0;
+      }
+      assert(copy_it == it);
+      tx_buffers.push_back(infiniband->get_tx_chunk_by_buffer(it->raw_c_str()));
+      total += it->length();
+      ++copy_it;
+    } else {
+      need_reserve_bytes += it->length();
     }
-    /* step 0 check addr had been regisetered */
-    std::unordered_map<char*, Chunk*>::const_iterator flag= pending_chunks.find((char*)buffer_addr);
-
-    if(flag!=pending_chunks.end()){
-      beg = Cycles::rdtsc();
-      ldout(cct,10) << __func__ << " find reged addr : " << buffer_addr << dendl;
-      ibv_mr* new_mr = flag->second->mr;
-      auto old_mr_len = flag->second->mr->length;
-      if(old_mr_len < buffer_size){
-            ibv_dereg_mr(new_mr);
-            new_mr = ibv_reg_mr(qp->get_pd(), (char *)buffer_addr, buffer_size, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
-            ldout(cct, 10) << __func__ << " mr old size : " << old_mr_len << " need size: " << buffer_size <<" dereg old mr then reg new"<< dendl;
-      }
-      Chunk *need_dereg = nullptr;      
-      for (unsigned offset = 0; offset < buffer_size; offset += conf_size){
-        std::unordered_map<char*, Chunk*>::const_iterator it= pending_chunks.find((char*)buffer_addr+offset);
-        ldout(cct, 10) << __func__ << " reged addr offset : " << offset << dendl;
-        if(it!=pending_chunks.end()){
-          Chunk* reged_chunk = it->second;
-          reged_chunk->mr = new_mr;
-          need_dereg = reged_chunk;
-          if(buffer_size - offset < conf_size){
-            reged_chunk->set_offset(buffer_size - offset);
-            cache_hit += buffer_size - offset;
-          } else{
-            reged_chunk->set_offset(conf_size);
-            cache_hit += conf_size;
-          }
-          ldout(cct, 10) << __func__ << " chunk offset : " << reged_chunk->offset << dendl;
-          tx_buffers.push_back(reged_chunk);
-          
-        }else{
-          auto chunk_base = static_cast<Chunk*>(::malloc(sizeof(Chunk)));
-          memset(static_cast<void*>(chunk_base), 0, sizeof(Chunk));
-          Chunk* new_chunk = chunk_base;
-          if(buffer_size - offset < conf_size){
-            new(new_chunk) Chunk(new_mr, buffer_size - offset,(char *) buffer_addr + offset);
-            new_chunk->set_offset(buffer_size - offset);
-            ldout(cct,10) << __func__ << " set offset: " << buffer_size - offset << dendl;
-          }
-          else{
-            new(new_chunk) Chunk(new_mr, conf_size,(char *) buffer_addr + offset);
-            new_chunk->set_offset(conf_size);
-            ldout(cct, 10) << __func__ << " set offset: "<<conf_size  << dendl;
-          }
-          need_dereg = new_chunk;
-          tx_buffers.push_back(new_chunk);
-          pending_chunks.insert(std::make_pair((char*)buffer_addr+offset, new_chunk));
-        }
-      }
-      need_dereg->set_last();
-      total += buffer_size;
-      ++it;
-      end = Cycles::rdtsc();
-      auto time = Cycles::to_microseconds(end-beg);
-      if(buffer_size > conf_size){
-       total_time += time;
-       total_num ++; 
-       ldout(cct, 0) << __func__ << " need size :" << total_size << " bytes,"<<" hit size: "<< cache_hit<<"bytes" <<dendl;
-      }      
-      continue;  
-    }
-    /* step 1 register memory */
-    ibv_mr* m = ibv_reg_mr(qp->get_pd(), (char *)buffer_addr, buffer_size, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
-    assert(m);
-    /* step 2 build new chunk */
-    //auto chunk_base = static_cast<Chunk*>(::malloc(sizeof(Chunk) * mr_num));
-    //memset(static_cast<void*>(chunk_base), 0, sizeof(Chunk) * mr_num);
-    //Chunk* new_chunk = chunk_base;
-    Chunk* need_dereg = nullptr;
-    for (unsigned offset = 0; offset < buffer_size; offset += conf_size){
-     auto chunk_base = static_cast<Chunk*>(::malloc(sizeof(Chunk)));
-      memset(static_cast<void*>(chunk_base), 0, sizeof(Chunk));
-      Chunk* new_chunk = chunk_base;
-      need_dereg = new_chunk;
-      if(buffer_size - offset < conf_size){
-	    new(new_chunk) Chunk(m, buffer_size - offset,(char *) buffer_addr + offset);
-        new_chunk->set_offset(buffer_size - offset);;
-        ldout(cct, 10) << __func__ << " set offset: " << buffer_size - offset << dendl;
-      }
-      else{
-        new(new_chunk) Chunk(m, conf_size,(char *) buffer_addr + offset);
-        new_chunk->set_offset(conf_size);
-        ldout(cct, 10) << __func__ << " set offset: "<<conf_size  << dendl;
-      }
-      tx_buffers.push_back(new_chunk);
-      pending_chunks.insert(std::make_pair((char*)buffer_addr+offset, new_chunk));
-    }
-    need_dereg->set_last();
-    total += buffer_size;
     ++it;
- }
+  }
+  if (need_reserve_bytes)
+    total += fill_tx_via_copy(tx_buffers, need_reserve_bytes, copy_it, it);
 
-Chunk *back_chunk = tx_buffers.back();
-back_chunk->bl.claim_append(data_bl);
-// sending:
-  int r = post_work_request(tx_buffers);
-  if(r < 0)
-    return r;
-
+ sending:
   if (total == 0)
     return -EAGAIN;
-  //pending_bl.claim_append(data_bl);
-  /*bufferlist swapped;
+  assert(total <= pending_bl.length());
+  bufferlist swapped;
   if (total < pending_bl.length()) {
     worker->perf_logger->inc(l_msgr_rdma_tx_parital_mem);
     pending_bl.splice(total, pending_bl.length()-total, &swapped);
@@ -615,10 +523,9 @@ back_chunk->bl.claim_append(data_bl);
   int r = post_work_request(tx_buffers);
   if (r < 0)
     return r;
-  */
-  //ldout(cct, 20) << __func__ << " finished sending " << bytes << " bytes." << dendl;
-  //return pending_bl.length() ? -EAGAIN : 0;
-  return 0;
+
+  ldout(cct, 20) << __func__ << " finished sending " << bytes << " bytes." << dendl;
+  return pending_bl.length() ? -EAGAIN : 0;
 }
 
 int RDMAConnectedSocketImpl::post_work_request(std::vector<Chunk*> &tx_buffers)
@@ -672,58 +579,14 @@ int RDMAConnectedSocketImpl::post_work_request(std::vector<Chunk*> &tx_buffers)
   }
   qp->add_tx_wr(num);
   worker->perf_logger->inc(l_msgr_rdma_tx_chunks, tx_buffers.size());
-  ldout(cct, 0) << __func__ << " qp state is " << Infiniband::qp_state_string(qp->get_state()) << dendl;
+  ldout(cct, 20) << __func__ << " qp state is " << Infiniband::qp_state_string(qp->get_state()) << dendl;
   return 0;
-}
-bool RDMAConnectedSocketImpl::is_waiting_buffer(char *c) {
-  Mutex::Locker l(lock);
-  std::unordered_map<char*,Chunk*>::const_iterator it = pending_chunks.find(c);
-  if(it == pending_chunks.end())
-    return false;
-    
-  return true; 
-  
-}
-void RDMAConnectedSocketImpl::deg_all_mr() {
-  Mutex::Locker l(lock);
-  std::unordered_map<char*,Chunk*>::const_iterator it = pending_chunks.begin();
-  for(;it != pending_chunks.end();++it){
-    Chunk* c = it->second;
-    if(c->is_last()){
-        auto ret = ibv_dereg_mr(c->mr);
-        assert(ret == 0);
-        ldout(cct, 0) << __func__ << " dereg succeed.. "<<dendl;
-      }
-    c->~Chunk();
-    ::free(it->second);
-  }
-}
-
-void RDMAConnectedSocketImpl::clear_waiting_bl() {
-  //if(waiting_clear_size < 4194304)
-    //return;
-  Mutex::Locker l(lock);
-  ldout(cct,0)<<__func__ << " swap bl length: " << pending_bl.length() << " waiting clear size: "<< waiting_clear_size<<dendl;  
-  //bufferlist swapped;
-  //if(pending_bl.length() > waiting_clear_size){
-    // pending_bl.splice(waiting_clear_size, pending_bl.length() - waiting_clear_size, &swapped);
-    // pending_bl.swap(swapped);
-  //} else {
-     pending_bl.clear();
-  //}
-  //waiting_clear_size = 0;
-  ldout(cct,0) << __func__ << " after splice, swap buffer: " << pending_bl.length() << dendl;
 }
 
 void RDMAConnectedSocketImpl::fin() {
-  deg_all_mr();
   ibv_send_wr wr;
   memset(&wr, 0, sizeof(wr));
-
-  auto chunk_base = static_cast<Chunk*>(::malloc(sizeof(Chunk)));   
-  memset(static_cast<void*>(chunk_base), 0, sizeof(Chunk));
-  Chunk* new_chunk = chunk_base; 
-  wr.wr_id = reinterpret_cast<uint64_t>(new_chunk);
+  wr.wr_id = reinterpret_cast<uint64_t>(qp);
   wr.num_sge = 0;
   wr.opcode = IBV_WR_SEND;
   wr.send_flags = IBV_SEND_SIGNALED;
@@ -735,7 +598,6 @@ void RDMAConnectedSocketImpl::fin() {
     worker->perf_logger->inc(l_msgr_rdma_tx_failed);
     return ;
   }
-  ldout(cct, 0) << __func__ << " send fin msg..." << dendl;
   qp->add_tx_wr(1);
 }
 

@@ -37,7 +37,7 @@
 #include "common/perf_counters.h"
 #include "msg/msg_types.h"
 #include "msg/async/net_handler.h"
-
+#include <sys/eventfd.h>
 #define HUGE_PAGE_SIZE (2 * 1024 * 1024)
 #define ALIGN_TO_PAGE_SIZE(x) \
   (((x) + HUGE_PAGE_SIZE -1) / HUGE_PAGE_SIZE * HUGE_PAGE_SIZE)
@@ -154,6 +154,10 @@ enum {
 
   l_msgr_rdma_created_queue_pair,
   l_msgr_rdma_active_queue_pair,
+  
+  //l_msgr_rdma_running_total_time,
+  //l_msgr_rdma_handling_tx_time,
+  //l_msgr_rdma_handling_rx_time,
 
   l_msgr_rdma_dispatcher_last,
 };
@@ -204,8 +208,7 @@ class Infiniband {
       bool full();
       bool over();
       void clear();
-      bool is_last() const {return last;};
-      void set_last() {last = true;};
+
      public:
       ibv_mr* mr;
       uint32_t lkey = 0;
@@ -214,9 +217,6 @@ class Infiniband {
       uint32_t offset;
       char* buffer; // TODO: remove buffer/refactor TX
       char  data[0];
-      bufferlist bl;
-      bool copy = false;
-      bool last = false;
     };
 
     class Cluster {
@@ -252,12 +252,15 @@ class Infiniband {
      public:
       MemoryManager *manager;
       unsigned n_bufs_allocated;
+      std::atomic<unsigned> n_bufs_left;
       // true if it is possible to alloc
       // more memory for the pool
       MemPoolContext(MemoryManager *m) :
         perf_logger(nullptr),
         manager(m),
-        n_bufs_allocated(0) {}
+        n_bufs_allocated(0),
+        n_bufs_left(0)
+        {}
       bool can_alloc(unsigned nbufs);
       void update_stats(int val);
       void set_stat_logger(PerfCounters *logger);
@@ -293,21 +296,71 @@ class Infiniband {
     class mem_pool : public boost::pool<PoolAllocator> {
      private:
       MemPoolContext *ctx;
+      std::thread mem_daemon;
+      int notify_malloc = -1;
+      uint64_t write_int = 0;
+      bool stop = false;
+      bool start = false;
+      unsigned malloc_threshold = 0;
       void *slow_malloc();
-
+      //Mutex pool_lock;
      public:
+     void polling(){
+        uint64_t i = 0;
+        while(1){
+          int r = ::read(notify_malloc, &i, sizeof(i));
+          if(stop)
+            break;
+          if(ctx->n_bufs_left < malloc_threshold){
+            cout << "nbufs: "<< ctx->n_bufs_left <<" ,threshold: " << malloc_threshold <<"\n";
+            cout<<"begin malloc\n";
+            slow_malloc();
+            write_int = 0;
+            cout<<"end malloc\n";
+          }
+        }
+      }
       explicit mem_pool(MemPoolContext *ctx, const size_type nrequested_size,
           const size_type nnext_size = 32,
           const size_type nmax_size = 0) :
         pool(nrequested_size, nnext_size, nmax_size),
-        ctx(ctx) { }
+        ctx(ctx) {
+          malloc_threshold = nnext_size>>2;
+          notify_malloc = eventfd(0, EFD_CLOEXEC);
+          assert(notify_malloc >= 0);
+          if(!mem_daemon.joinable()){
+               mem_daemon = std::thread(&Infiniband::MemoryManager::mem_pool::polling, this);
+               ceph_pthread_setname(mem_daemon.native_handle(), "rdma-memory-monitor-polling");
+          }
+        }
 
+       ~mem_pool(){
+         if(!mem_daemon.joinable())
+            return;
+         stop = true;
+         uint64_t i = 1;
+         write(notify_malloc, &i, sizeof(i));
+         mem_daemon.join();
+      }
       void *malloc() {
+        //check ctx->n_bufs_allocated
+        //cout << "nbufs: "<< ctx->n_bufs_left <<" ,threshold: " << malloc_threshold <<"\n";
+        if(!write_int && ctx->n_bufs_left < malloc_threshold){
+          if(!start){
+            start = true;
+            return slow_malloc();
+          }
+          write_int = 1;
+          assert(sizeof(write_int) == write(notify_malloc, &write_int, sizeof(write_int)));
+        }
         if (!store().empty())
           return (store().malloc)();
         // need to alloc more memory...
         // slow path code
-        return slow_malloc();
+        //return slow_malloc();
+        //while(store().empty()){sleep(0.001);}
+          //write_int = (write_int == 0) ? 1 : 0;
+          return nullptr;
       }
     };
 
@@ -329,11 +382,16 @@ class Infiniband {
     }
 
     Chunk *get_rx_buffer() {
-       return reinterpret_cast<Chunk *>(rxbuf_pool.malloc());
+       //rxbuf_pool_ctx.n_bufs_left--;
+       auto p = reinterpret_cast<Chunk *>(rxbuf_pool.malloc());
+       rxbuf_pool_ctx.n_bufs_left--;
+       return p;
     }
 
     void release_rx_buffer(Chunk *chunk) {
+      //rxbuf_pool_ctx.n_bufs_left++;
       rxbuf_pool.free(chunk);
+      rxbuf_pool_ctx.n_bufs_left++;
     }
 
     void set_rx_stat_logger(PerfCounters *logger) {
@@ -477,7 +535,7 @@ class Infiniband {
     Infiniband::CompletionQueue* get_rx_cq() const { return rxcq; }
     int to_dead();
     bool is_dead() const { return dead; }
-    ibv_pd* get_pd(){ return pd;}
+
    private:
     CephContext  *cct;
     Infiniband&  infiniband;     // Infiniband to which this QP belongs

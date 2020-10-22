@@ -183,14 +183,7 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
   std::vector<Chunk*> buffers;
   int notify_fd = -1;
   bufferlist pending_bl;
-  std::unordered_map<char*,Chunk*> pending_chunks; 
 
-  uint64_t total_time= 0;
-  uint64_t total_num = 0; 
-  uint64_t total_size = 0;
-  uint64_t cache_hit = 0;
-  
-  uint32_t waiting_clear_size = 0;
   Mutex lock;
   std::vector<ibv_wc> wc;
   bool is_server;
@@ -207,8 +200,7 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
   RDMAConnectedSocketImpl(CephContext *cct, Infiniband* ib, RDMADispatcher* s,
                           RDMAWorker *w);
   virtual ~RDMAConnectedSocketImpl();
-  void deg_all_mr();
-  bool is_waiting_buffer(char* c);
+
   void pass_wc(std::vector<ibv_wc> &&v);
   void get_wc(std::vector<ibv_wc> &w);
   virtual int is_connected() override { return connected; }
@@ -221,11 +213,7 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
   virtual int fd() const override { return notify_fd; }
   void fault();
   const char* get_qp_state() { return Infiniband::qp_state_string(qp->get_state()); }
-  //ssize_t submit(bool more);
-  ssize_t zero_copy_send(bufferlist &bl, bool more);
-  void waiting_clear_add(uint32_t add){ waiting_clear_size += add; }  
-  void clear_waiting_bl();
-
+  ssize_t submit(bool more);
   int activate();
   void fin();
   void handle_connection();
