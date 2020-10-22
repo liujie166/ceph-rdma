@@ -299,11 +299,10 @@ class Infiniband {
       std::thread mem_daemon;
       int notify_malloc = -1;
       uint64_t write_int = 0;
-      bool stop = false;
       bool start = false;
+      bool stop = false;
       unsigned malloc_threshold = 0;
       void *slow_malloc();
-      //Mutex pool_lock;
      public:
      void polling(){
         uint64_t i = 0;
@@ -313,10 +312,9 @@ class Infiniband {
             break;
           if(ctx->n_bufs_left < malloc_threshold){
             cout << "nbufs: "<< ctx->n_bufs_left <<" ,threshold: " << malloc_threshold <<"\n";
-            cout<<"begin malloc\n";
             slow_malloc();
             write_int = 0;
-            cout<<"end malloc\n";
+
           }
         }
       }
@@ -343,8 +341,6 @@ class Infiniband {
          mem_daemon.join();
       }
       void *malloc() {
-        //check ctx->n_bufs_allocated
-        //cout << "nbufs: "<< ctx->n_bufs_left <<" ,threshold: " << malloc_threshold <<"\n";
         if(!write_int && ctx->n_bufs_left < malloc_threshold){
           if(!start){
             start = true;
@@ -357,9 +353,6 @@ class Infiniband {
           return (store().malloc)();
         // need to alloc more memory...
         // slow path code
-        //return slow_malloc();
-        //while(store().empty()){sleep(0.001);}
-          //write_int = (write_int == 0) ? 1 : 0;
           return nullptr;
       }
     };
